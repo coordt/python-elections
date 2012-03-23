@@ -16,6 +16,7 @@ import calculate
 from ftplib import FTP
 from datetime import date
 from cStringIO import StringIO
+from BeautifulSoup import BeautifulStoneSoup
 from dateutil.parser import parse as dateparse
 
 
@@ -93,6 +94,14 @@ class AP(object):
         self.ftp.quit()
         return result
     
+    def get_delegate_summary(self):
+        """
+        Return a nationwide summary and state-level totals contain 
+        delegate counts for all the candidates in the presidential 
+        nomination contest held by the two major parties.
+        """
+        return DelegateSummary(self).nominations
+
     #
     # Private methods
     #
@@ -218,7 +227,11 @@ class AP(object):
         return list(itertools.izip_longest(*args, fillvalue=fillvalue))
 
 
-class BaseAPResults(object):
+#
+# Result collections
+#
+
+class BaseAPResultCollection(object):
     """
     Base class that defines the methods to retrieve AP CSV 
     data and shared properties and methods for State and 
@@ -327,7 +340,7 @@ class BaseAPResults(object):
         respective counties. 
         """
         # Filter out the state level data
-        ru_list = [o for o in self.reporting_units if o.fips and not o.is_state]
+        ru_list = [o for o in self.reporting_units if o.fips and not o.is_state and o.fips != '00000']
         # If the AP reports sub-County data for this state, as they do for some
         # New England states, we'll need to aggregate it here. If not, we can
         # just pass out the data "as is."
@@ -578,16 +591,10 @@ class BaseAPResults(object):
             is_state = row['county_number'] == '1'
             county_number = str(row['county_number'])
             
-            # AP stupidly strips leading 0s in the FIPS for the 
-            # results file. This fixes em.
-#            if is_state:
-#                fips = '00000'
-#            else:
-#                if self.leading_zero_fips and fips[0] != '0':
-#                    fips = '0' + fips
-            
             # Pull the reporting unit
-            reporting_unit = race.get_reporting_unit("%s%s" % (row['county_name'], county_number))
+            reporting_unit = race.get_reporting_unit(
+                "%s%s" % (row['county_name'], county_number)
+            )
             # Loop through all the candidates
             votes_cast = 0
             for cand in row['candidates']:
@@ -627,6 +634,7 @@ class BaseAPResults(object):
                 reporting_unit.update_result(result)
                 
             # Update the reporting unit's precincts status
+            reporting_unit.precincts_total = int(row['total_precincts'])
             reporting_unit.precincts_reporting = int(row['precincts_reporting'])
             reporting_unit.precincts_reporting_percent = calculate.percentage(
                 reporting_unit.precincts_reporting,
@@ -644,7 +652,8 @@ class BaseAPResults(object):
                     votes_cast
                 )
 
-class State(BaseAPResults):
+
+class State(BaseAPResultCollection):
     """
     One of these United States.
     
@@ -662,7 +671,7 @@ class State(BaseAPResults):
         super(State, self).__init__(client, name, results, delegates)
 
 
-class TopOfTicket(BaseAPResults):
+class TopOfTicket(BaseAPResultCollection):
     """
     These United States.
     
@@ -682,6 +691,140 @@ class TopOfTicket(BaseAPResults):
     def states(self):
         return [o for o in self._reporting_units.values() if o.is_state]
 
+
+class DelegateSummary(object):
+    """
+    A result collection that contains a summary of delegates won by candidates
+    seeking a party's presidential nomination.
+    """
+    summary_file_path = "Delegate_Tracking/Reports/delsum.xml"
+    state_file_path = "Delegate_Tracking/Reports/delstate.xml"
+    
+    def __init__(self, client):
+        self.client = client
+        self.nominations = []
+        self.fetch()
+    
+    def __unicode__(self):
+        return unicode(self.name)
+    
+    def __str__(self):
+        return self.__unicode__().encode("utf-8")
+     
+    def __repr__(self):
+        return '<%s: %s>' % (self.__class__.__name__, self.__unicode__())
+    
+    def fetch(self):
+        # Pull the nationwide summary file
+        summary = self.client._fetch(self.summary_file_path)
+        summarysoup = BeautifulStoneSoup(summary)
+        # Pull the state-by-state summary file
+        states = self.client._fetch(self.state_file_path)
+        statesoup = BeautifulStoneSoup(states)
+        # Loop through the parties in the nationwide summary
+        for party in summarysoup.find("delsum").findAll("del"):
+            # Create a nomination object for each
+            nom = Nomination(
+                party = party['pid'],
+                delegates_needed = int(party['dneed']),
+                delegates_total = int(party['dvotes']),
+                delegates_chosen = int(party['dchosen']),
+            )
+            # Loop through the nationwide totals for each candidate
+            for cand in party.findAll("cand"):
+                # And create a candidate object with that nationwide total
+                cand_obj = Candidate(
+                    ap_natl_number = cand['cid'],
+                    last_name = cand['cname'],
+                    delegates = int(cand['dtot'])
+                )
+                nom._candidates.append(cand_obj)
+            # Loop through the state data
+            for stateparty in statesoup.find("delstate").findAll("del"):
+                # If the party matches our current nationwide loop...
+                if stateparty['pid'] == party['pid']:
+                    # Then loop through all the states
+                    for state in stateparty.findAll("state"):
+                        state_obj = StateDelegation(
+                            name = state['sid'],
+                        )
+                        # Now loop through the candidates in this state
+                        for statecand in state.findAll("cand"):
+                            cand_obj = Candidate(
+                                ap_natl_number = statecand['cid'],
+                                last_name = statecand['cname'],
+                                delegates = int(statecand['dtot'])
+                            )
+                            state_obj._candidates.append(cand_obj)
+                        nom._states.append(state_obj)
+            # Add the nomination to our finished list now that it's got data
+            self.nominations.append(nom)
+
+#
+# Delegate result objects
+#
+
+class Nomination(object):
+    """
+    A contest to be the presidential nominee of one of the two major parties.
+    
+    Results are determined by delegates, not by votes.
+    """
+    def __init__(self, party, delegates_needed, delegates_total, delegates_chosen):
+        self.party = party
+        self.delegates_needed = delegates_needed
+        self.delegates_total = delegates_total
+        self.delegates_chosen = delegates_chosen
+        self.delegates_chosen_percent = calculate.percentage(
+            delegates_chosen,
+            delegates_total
+        )
+        self._candidates = []
+        self._states = []
+    
+    def __unicode__(self):
+        return unicode(self.party)
+    
+    def __str__(self):
+        return self.__unicode__().encode("utf-8")
+    
+    def __repr__(self):
+        return '<%s: %s>' % (self.__class__.__name__, self.__unicode__())
+    
+    @property
+    def candidates(self):
+        return sorted(self._candidates, key=lambda x: x.delegates, reverse=True)
+    
+    @property
+    def states(self):
+        return sorted(self._states, key=lambda x: x.name)
+
+
+class StateDelegation(object):
+    """
+    A state's delegation and who they choose to be a party's presidential nominee.
+    """
+    def __init__(self, name):
+        self.name = name
+        self._candidates = []
+    
+    def __unicode__(self):
+        return unicode(self.name)
+    
+    def __str__(self):
+        return self.__unicode__().encode("utf-8")
+    
+    def __repr__(self):
+        return '<%s: %s>' % (self.__class__.__name__, self.__unicode__())
+    
+    @property
+    def candidates(self):
+        return sorted(self._candidates, key=lambda x: x.delegates, reverse=True)
+
+
+#
+# Election result objects
+#
 
 class Race(object):
     """
@@ -792,7 +935,7 @@ class Race(object):
         of ReportingUnit objects.
         """
         ru_list = sorted(
-            [o for o in self.reporting_units if o.fips and not o.is_state],
+            [o for o in self.reporting_units if o.fips and not o.is_state and o.fips != '00000'],
             key=lambda x: x.name
         )
         # If the AP reports sub-County data for this state, as they do for some
@@ -922,7 +1065,7 @@ class ReportingUnit(object):
     
     @property
     def is_state(self):
-        return self.fips == '00000'
+        return self.ap_number == '1'
 
 
 class Candidate(object):
@@ -964,7 +1107,7 @@ class Candidate(object):
     @property
     def name(self):
         if not self.last_name in ('Yes', 'No'):
-            s = u'%s %s' % (self.first_name, self.last_name)
+            s = " ".join([i for i in [self.first_name, self.last_name] if i])
             return s.strip()
         else:
             return u'%s' % self.last_name
@@ -1017,6 +1160,22 @@ class BadCredentialsError(Exception):
 #
 
 COUNTY_CROSSWALK = {
+    'MA': {
+        '25001': 'Barnstable',
+        '25003': 'Berkshire',
+        '25005': 'Bristol',
+        '25007': 'Dukes',
+        '25009': 'Essex',
+        '25011': 'Franklin',
+        '25013': 'Hampden',
+        '25015': 'Hampshire',
+        '25017': 'Middlesex',
+        '25019': 'Nantucket',
+        '25021': 'Norfolk',
+        '25023': 'Plymouth',
+        '25025': 'Suffolk',
+        '25027': 'Worcester',
+    },
     'NH': {
         '33001': 'Belknap',
         '33003': 'Carroll',
